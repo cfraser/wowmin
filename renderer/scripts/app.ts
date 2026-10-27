@@ -19,6 +19,7 @@ import { CONTINENT_BOUNDS, worldToCanvas } from './utils/map-coords';
 import { getEnglishMotd, getServerUptime } from './utils/dashboard-data';
 import { calculateSessionTotalsAt, formatSessionReplayTime, isSessionRouteDiscontinuity } from './utils/session-replay';
 import { getClassIconHtml, getClassIconImage, getPlayerStateIconsHtml, getPlayerStateIndicators, getRacePortraitHtml, getResponsivePlayerIconScale, getStateIconImage, loadPlayerIconManifest } from './utils/player-icons';
+import { sceneExportNotice, sceneExportStatus } from '../../src/scene-export-version';
 import { formatBattlegroundOutcome } from '../../src/session-outcome';
 import { AppState, createInitialState, PlayerInfo } from './types/state';
 import type { CreatureInfo, StreamBotDecision, StreamCreatureSample, StreamStatus } from '../../src/types/api';
@@ -6487,9 +6488,15 @@ const $instanceObjectLightsBtn = $<HTMLButtonElement>('instance-object-lights-bt
 const $instanceDecisionsBtn = $<HTMLButtonElement>('instance-decisions-btn');
 const $instanceModelsBtn = $<HTMLButtonElement>('instance-models-btn');
 const $instanceNumbersBtn = $<HTMLButtonElement>('instance-numbers-btn');
+const $instanceGlowsBtn = $<HTMLButtonElement>('instance-glows-btn');
+const $instanceCirclesBtn = $<HTMLButtonElement>('instance-circles-btn');
 const $instanceBotCard = $<HTMLElement>('instance-bot-card');
 const $instanceBotDecisions = $<HTMLElement>('instance-bot-decisions');
 const $instanceDebugOverlay = $<HTMLElement>('instance-debug-overlay');
+const $instanceSceneNotice = $<HTMLElement>('instance-scene-notice');
+const $instanceSceneNoticeText = $<HTMLElement>('instance-scene-notice-text');
+// Maps whose scene notice the viewer has dismissed, until the page reloads.
+const dismissedSceneNotices = new Set<number>();
 const $instanceWatchTitle = $<HTMLElement>('instance-watch-title');
 const $instanceWatchSubtitle = $<HTMLElement>('instance-watch-subtitle');
 const $instanceWatchStatus = $<HTMLElement>('instance-watch-status');
@@ -6523,6 +6530,9 @@ interface InstanceMapAssetMetadata {
 // <mapId>.scene.json, written by npm run extract:scenes.
 interface InstanceSceneMetadata {
   schemaVersion: number;
+  // The export's version (src/scene-export-version.ts); absent before it
+  // was kept.
+  exportVersion?: number;
   mapId: number;
   file: string;
   bounds: SceneBox;
@@ -6637,6 +6647,11 @@ let instanceShowModels = readStoredInstanceModels();
 const instanceCombatEffects = new CombatEffectStore();
 const INSTANCE_NUMBERS_STORAGE_KEY = 'wowmin.instanceNumbers';
 let instanceShowNumbers = readStoredInstanceNumbers();
+// WowMin's own spell aids beside the game's art: glows, and floor circles.
+const INSTANCE_GLOWS_STORAGE_KEY = 'wowmin.instanceGlows';
+const INSTANCE_CIRCLES_STORAGE_KEY = 'wowmin.instanceCircles';
+let instanceShowGlows = readStoredFlag(INSTANCE_GLOWS_STORAGE_KEY, true);
+let instanceShowCircles = readStoredFlag(INSTANCE_CIRCLES_STORAGE_KEY, true);
 // Rough model heights in yards, for placing labels and click targets above
 // a model rather than at its feet.
 const INSTANCE_PLAYER_MODEL_HEIGHT = 2.2;
@@ -7007,6 +7022,19 @@ async function loadInstanceScene(mapId: number): Promise<void> {
   }
 }
 
+// Says over the 3D view when the map's scene comes from an older export
+// than this WoWMin draws (or a newer one than it understands), and what to
+// run; hidden for current scenes, the flat map, and once dismissed.
+function renderInstanceSceneNotice(mapId: number | null): void {
+  if (!$instanceSceneNotice || !$instanceSceneNoticeText) return;
+  const scene = mapId === null ? null : getInstanceScene(mapId);
+  const notice = scene && instanceView3d && !dismissedSceneNotices.has(scene.mapId)
+    ? sceneExportNotice(sceneExportStatus(scene.exportVersion)) : null;
+  $instanceSceneNotice.hidden = !notice;
+  $instanceSceneNoticeText.textContent = notice ?? '';
+  if (scene) $instanceSceneNotice.dataset.mapId = String(scene.mapId);
+}
+
 function getInstanceSceneUrl(mapId: number): string | null {
   const scene = getInstanceScene(mapId);
   return scene ? new URL(scene.file, getInstanceSceneManifestUrl(mapId)).href : null;
@@ -7093,6 +7121,20 @@ function setInstanceShowNumbers(enabled: boolean): void {
   instanceShowNumbers = enabled;
   $instanceNumbersBtn?.setAttribute('aria-pressed', String(enabled));
   storeSetting(INSTANCE_NUMBERS_STORAGE_KEY, String(enabled));
+  renderInstanceCanvas();
+}
+
+function setInstanceShowGlows(enabled: boolean): void {
+  instanceShowGlows = enabled;
+  $instanceGlowsBtn?.setAttribute('aria-pressed', String(enabled));
+  storeSetting(INSTANCE_GLOWS_STORAGE_KEY, String(enabled));
+  renderInstanceCanvas();
+}
+
+function setInstanceShowCircles(enabled: boolean): void {
+  instanceShowCircles = enabled;
+  $instanceCirclesBtn?.setAttribute('aria-pressed', String(enabled));
+  storeSetting(INSTANCE_CIRCLES_STORAGE_KEY, String(enabled));
   renderInstanceCanvas();
 }
 
@@ -8317,12 +8359,19 @@ function drawInstanceCanvas(followPass: boolean): void {
   // Where the units shown stand, for combat effects: effects on units that
   // aren't shown (the mobs selector, other floors) are skipped.
   const combatPositions = new Map<UnitKey, Point3>();
+  // Creatures' type_flags, for the spell colours the client skips on some.
+  const creatureTypeFlags = new Map<UnitKey, number>();
   if (live) {
     for (const player of visiblePlayers) {
       const guid = instanceLivePositions.guidOf(player.name);
       if (guid !== null) combatPositions.set(unitKey(guid, false), [player.position_x, player.position_y, player.position_z]);
     }
-    for (const creature of creatures) combatPositions.set(unitKey(creature.guid, true), [creature.x, creature.y, creature.z]);
+    for (const creature of creatures) {
+      const key = unitKey(creature.guid, true);
+      combatPositions.set(key, [creature.x, creature.y, creature.z]);
+      const typeFlags = instanceCreatureInfo.get(creature.entry)?.typeFlags;
+      if (typeFlags) creatureTypeFlags.set(key, typeFlags);
+    }
   }
   const strikes = new Map(live ? instanceCombatEffects.advance(liveNow, (from, to) => {
     const start = combatPositions.get(from);
@@ -8338,7 +8387,8 @@ function drawInstanceCanvas(followPass: boolean): void {
       ? getInstanceUnitPoses(visiblePlayers, creatures, decisions, liveNow, strikes, sceneryGuids) : [], liveNow)
     : new Set<string>();
   const effectsDrawn = sceneView?.setEffects(live && instanceView3d ? instanceCombatEffects : null, combatPositions, liveNow,
-    live ? instanceLiveAuras.all(liveNow) : undefined, (spellId) => instanceSpellNames.isTaunt(spellId)) ?? 0;
+    live ? instanceLiveAuras.all(liveNow) : undefined, (spellId) => instanceSpellNames.isTaunt(spellId),
+    { glows: instanceShowGlows, circles: instanceShowCircles }, (unit) => creatureTypeFlags.get(unit) ?? 0) ?? 0;
   sceneView?.setGameObjects(live && instanceView3d ? getInstanceGameObjectPoses(liveNow) : [], liveNow);
   const bossPositions = creatures
     .filter((creature) => isBossCreature(creature, instanceCreatureInfo.get(creature.entry)))
@@ -8870,8 +8920,11 @@ function renderInstanceDebugOverlay(now: number): void {
   const frames = getInstanceDebugStats('frame', now);
   const perSecond = (kind: string) => (getInstanceDebugStats(kind, now).total / (INSTANCE_DEBUG_WINDOW_MS / 1000)).toFixed(1);
   const session = getSelectedInstanceSession();
+  const sceneExport = session ? getInstanceScene(session.mapId)?.exportVersion ?? 1 : null;
+  const sceneStatus = sceneExport === null ? 'current' : sceneExportStatus(sceneExport);
   const scene = $instanceWatchScene && !$instanceWatchScene.hidden
     ? `3D · ${$instanceWatchScene.dataset.drawCalls ?? '?'} draws · ${Math.round(Number($instanceWatchScene.dataset.triangles ?? 0) / 1000)}k tris · ${$instanceWatchScene.dataset.buffer ?? '?'} px`
+      + ` · export v${sceneExport}${sceneStatus === 'current' ? '' : ` (${sceneStatus})`}`
     : 'flat map';
   const floor = session ? getSelectedDungeonFloor(session) : null;
   const transform = getInstanceViewTransform();
@@ -8946,6 +8999,7 @@ function renderInstanceWatcher(): void {
       : null;
     $instanceWatchSubtitle.textContent = details
       ?? 'Sessions appear automatically while players or bots are inside an instance or battleground.';
+    renderInstanceSceneNotice(session?.mapId ?? null);
     $instanceFitBtn?.classList.remove('hidden');
     $instanceClearFocusBtn?.classList.toggle('hidden', !selectedInstancePlayerName);
   }
@@ -9223,6 +9277,10 @@ $instanceModelsBtn?.setAttribute('aria-pressed', String(instanceShowModels));
 $instanceModelsBtn?.addEventListener('click', () => setInstanceShowModels(!instanceShowModels));
 $instanceNumbersBtn?.setAttribute('aria-pressed', String(instanceShowNumbers));
 $instanceNumbersBtn?.addEventListener('click', () => setInstanceShowNumbers(!instanceShowNumbers));
+$instanceGlowsBtn?.setAttribute('aria-pressed', String(instanceShowGlows));
+$instanceGlowsBtn?.addEventListener('click', () => setInstanceShowGlows(!instanceShowGlows));
+$instanceCirclesBtn?.setAttribute('aria-pressed', String(instanceShowCircles));
+$instanceCirclesBtn?.addEventListener('click', () => setInstanceShowCircles(!instanceShowCircles));
 // Pointer-down too, as the card redraws every second and a click could
 // straddle a redraw.
 for (const type of ['pointerdown', 'click'] as const) {
@@ -9259,6 +9317,10 @@ setInstanceFades(instanceFades, false);
 $instanceFadesBtn?.addEventListener('click', () => setInstanceFades(!instanceFades));
 setInstanceObjectLights(instanceObjectLights, false);
 $instanceObjectLightsBtn?.addEventListener('click', () => setInstanceObjectLights(!instanceObjectLights));
+$instanceSceneNotice?.querySelector('button')?.addEventListener('click', () => {
+  dismissedSceneNotices.add(Number($instanceSceneNotice.dataset.mapId));
+  $instanceSceneNotice.hidden = true;
+});
 $instanceAutoRefresh?.addEventListener('change', () => {
   if ($instanceAutoRefresh.checked) {
     void refreshInstanceWatcher();
